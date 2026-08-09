@@ -1,8 +1,8 @@
 """
 Databricks App boilerplate:
-- Serves a small Flask API
+- Serves a Flask API
 - Reads/writes to Lakebase (Databricks-managed Postgres) via lakebase.py
-- Pulls data from the Massive API via massive_client.py and syncs it into Lakebase
+- Adapted for Job Hunter (Adzuna API)
 
 Run locally:
     python app.py
@@ -18,46 +18,47 @@ from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, render_template, request
 
 import lakebase
-from massive_client import MassiveClient
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("massive-app")
+logger = logging.getLogger("job-hunter-app")
 
 app = Flask(__name__)
 _w = WorkspaceClient()
 
-TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
-WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+TABLE_NAME = os.environ.get("ADZUNA_TABLE_NAME", "job_postings")
+SAVED_JOBS_TABLE_NAME = os.environ.get("SAVED_JOBS_TABLE_NAME", "saved_jobs")
 
-# Basic stock ticker shape check: 1-10 uppercase letters, with an optional
-# ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
-# malformed input before we even call the Massive API.
-_TICKER_RE = re.compile(r"^[A-Z]{1,10}(\.[A-Z]{1,2})?$")
+# Basic job title shape check
+_JOB_TITLE_RE = re.compile(r"^[A-Za-z0-9\s\-]{1,255}$")
 
 
-def ensure_table():
-    """Create the destination table in Lakebase if it doesn't exist yet."""
+def ensure_job_postings_table():
+    """Create the job postings table in Lakebase if it doesn't exist yet."""
     lakebase.run_write(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             id TEXT PRIMARY KEY,
-            payload JSONB NOT NULL,
-            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            title TEXT NOT NULL,
+            company TEXT,
+            location TEXT,
+            description TEXT,
+            url TEXT,
+            posted_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
     )
 
 
-def ensure_watchlist_table():
-    """Create the watchlist table in Lakebase if it doesn't exist yet."""
+def ensure_saved_jobs_table():
+    """Create the saved jobs table in Lakebase if it doesn't exist yet."""
     lakebase.run_write(
         f"""
-        CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE_NAME} (
-            symbol TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS {SAVED_JOBS_TABLE_NAME} (
+            job_id TEXT NOT NULL,
             email TEXT NOT NULL,
-            latest_price NUMERIC,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (symbol, email)
+            title TEXT,
+            saved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (job_id, email)
         )
         """
     )
@@ -65,7 +66,7 @@ def ensure_watchlist_table():
 
 def _current_user_email() -> str:
     """
-    Resolve the current user's email so the watchlist can be personalized.
+    Resolve the current user's email so the saved jobs can be personalized.
 
     Databricks Apps inject the logged-in user's identity via the
     X-Forwarded-Email header on every request. Fall back to the Databricks
@@ -84,8 +85,7 @@ def healthz():
 
 @app.errorhandler(Exception)
 def handle_exception(err):
-    """Ensure all unhandled errors return JSON (not an HTML error page),
-    so the frontend's resp.json() call never chokes on HTML."""
+    """Ensure all unhandled errors return JSON (not an HTML error page)."""
     logger.exception("Unhandled exception while processing request")
     status_code = getattr(err, "code", 500)
     if not isinstance(status_code, int):
@@ -95,162 +95,116 @@ def handle_exception(err):
 
 @app.route("/")
 def index():
-    """Simple UI to submit a list of stock symbols to sync from Massive."""
+    """Simple UI to view and manage job postings."""
     return render_template("index.html")
 
 
-@app.route("/records")
-def list_records():
-    """Read records already synced into Lakebase."""
+@app.route("/jobs")
+def list_jobs():
+    """Read job postings from Lakebase."""
+    ensure_job_postings_table()
     limit = int(request.args.get("limit", 100))
     rows = lakebase.run_query(
-        f"SELECT id, payload, synced_at FROM {TABLE_NAME} ORDER BY synced_at DESC LIMIT %s",
+        f"SELECT id, title, company, location, description, url, posted_at FROM {TABLE_NAME} ORDER BY posted_at DESC LIMIT %s",
         (limit,),
     )
     return jsonify(rows)
 
 
-@app.route("/sync", methods=["POST"])
-def sync_from_massive():
-    """
-    Pull data from the Massive API (paginated, potentially huge dataset) and
-    upsert it into Lakebase in batches.
-    """
-    ensure_table()
-    client = MassiveClient()
+@app.route("/jobs", methods=["POST"])
+def add_job():
+    """Add a job posting to Lakebase."""
+    ensure_job_postings_table()
 
-    path = request.json.get("path", "/records") if request.is_json else "/records"
-    batch_size = int(request.args.get("batch_size", 500))
+    if request.is_json:
+        data = request.json
+    else:
+        data = request.form.to_dict()
 
-    batch = []
-    total = 0
-    for item in client.paginated_get(path):
-        batch.append(item)
-        if len(batch) >= batch_size:
-            total += _upsert_batch(batch)
-            batch = []
+    title = data.get("title", "").strip()
+    company = data.get("company", "").strip()
+    location = data.get("location", "").strip()
+    description = data.get("description", "").strip()
+    url = data.get("url", "").strip()
+    job_id = data.get("id", "").strip()
 
-    if batch:
-        total += _upsert_batch(batch)
+    if not title or not _JOB_TITLE_RE.match(title):
+        return jsonify({"error": f"Invalid job title: {title!r}"}), 400
 
-    return jsonify({"synced": total})
+    if not job_id:
+        job_id = f"job_{title.replace(' ', '_').lower()}"
+
+    lakebase.run_write(
+        f"""
+        INSERT INTO {TABLE_NAME} (id, title, company, location, description, url, posted_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (id) DO UPDATE
+            SET title = EXCLUDED.title,
+                company = EXCLUDED.company,
+                location = EXCLUDED.location,
+                description = EXCLUDED.description,
+                url = EXCLUDED.url,
+                posted_at = EXCLUDED.posted_at
+        """,
+        (job_id, title, company, location, description, url),
+    )
+
+    return jsonify({"id": job_id, "title": title, "company": company, "location": location})
 
 
-@app.route("/watchlist", methods=["GET"])
-def get_watchlist():
-    """Return the current user's watchlist symbols, with their last known price."""
-    ensure_watchlist_table()
+@app.route("/saved-jobs", methods=["GET"])
+def get_saved_jobs():
+    """Return the current user's saved jobs."""
+    ensure_saved_jobs_table()
     email = _current_user_email()
     rows = lakebase.run_query(
-        f"SELECT symbol, email, latest_price, updated_at FROM {WATCHLIST_TABLE_NAME} "
-        f"WHERE email = %s ORDER BY symbol ASC",
+        f"SELECT job_id, title, saved_at FROM {SAVED_JOBS_TABLE_NAME} WHERE email = %s ORDER BY saved_at DESC",
         (email,),
     )
     return jsonify(rows)
 
 
-@app.route("/watchlist", methods=["POST"])
-def add_to_watchlist():
-    """
-    Fetch the latest price for a single stock symbol from Massive using
-    exactly ONE API call (see MassiveClient.get_latest_price), then add/
-    update that symbol on the watchlist in Lakebase.
-    """
-    ensure_watchlist_table()
+@app.route("/saved-jobs", methods=["POST"])
+def save_job():
+    """Save a job posting to the user's saved list."""
+    ensure_saved_jobs_table()
 
     if request.is_json:
-        symbol = request.json.get("symbol", "")
+        job_id = request.json.get("job_id", "")
+        title = request.json.get("title", "")
     else:
-        symbol = request.form.get("symbol", "")
+        job_id = request.form.get("job_id", "")
+        title = request.form.get("title", "")
 
-    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
-
-    if not symbol or not _TICKER_RE.match(symbol):
-        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
-
-    client = MassiveClient()
-    try:
-        data = client.get_latest_price(symbol)  # <-- single API call, latest price only
-    except requests.HTTPError:
-        # Massive returns a 404/4xx for tickers it doesn't recognize.
-        return jsonify({"error": f"Unknown ticker symbol: {symbol}"}), 400
-
-    price = _extract_latest_price(data)
-    if price is None:
-        # No usable price in the response (e.g. delisted/invalid ticker
-        # that still 200s with an empty result set) - don't add it.
-        return jsonify({"error": f"No price data available for ticker: {symbol}"}), 400
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
 
     email = _current_user_email()
 
     lakebase.run_write(
         f"""
-        INSERT INTO {WATCHLIST_TABLE_NAME} (symbol, email, latest_price, updated_at)
+        INSERT INTO {SAVED_JOBS_TABLE_NAME} (job_id, email, title, saved_at)
         VALUES (%s, %s, %s, now())
-        ON CONFLICT (symbol, email) DO UPDATE
-            SET latest_price = EXCLUDED.latest_price,
-                updated_at = EXCLUDED.updated_at
+        ON CONFLICT (job_id, email) DO NOTHING
         """,
-        (symbol, email, price),
+        (job_id, email, title),
     )
 
-    return jsonify({"symbol": symbol, "email": email, "latest_price": price})
+    return jsonify({"job_id": job_id, "email": email, "title": title})
 
 
-def _extract_latest_price(data: dict) -> float | None:
-    """Pull the trade price out of the Massive 'previous close' response shape.
+@app.route("/saved-jobs/<job_id>", methods=["DELETE"])
+def remove_saved_job(job_id):
+    """Remove a job from the user's saved list."""
+    ensure_saved_jobs_table()
+    email = _current_user_email()
 
-    The /v2/aggs/ticker/{symbol}/prev endpoint returns "results" as a LIST
-    containing a single aggregate bar (not a dict), e.g.:
-        {"status": "OK", "resultsCount": 1, "results": [{"c": 148.845, ...}]}
-    Previously this code treated "results" as a dict, so isinstance(results, dict)
-    was always False for this endpoint's real shape and the price silently
-    resolved to None. Unwrap the list here, and check "status"/"resultsCount"
-    so invalid tickers (empty results) are detected instead of "succeeding"
-    with a null price.
+    lakebase.run_write(
+        f"DELETE FROM {SAVED_JOBS_TABLE_NAME} WHERE job_id = %s AND email = %s",
+        (job_id, email),
+    )
 
-    Adjust the key lookup here if the real Massive API returns a different
-    field name for the traded/close price.
-    """
-    if not isinstance(data, dict):
-        return None
-    if data.get("status") not in (None, "OK") or data.get("resultsCount") == 0:
-        return None
-    results = data.get("results", data)
-    if isinstance(results, list):
-        results = results[0] if results else None
-    if isinstance(results, dict):
-        for key in ("c", "p", "price", "last_price", "vw"):
-            if key in results:
-                return results[key]
-    return None
-
-
-def _upsert_batch(items: list[dict]) -> int:
-    """Upsert a batch of Massive API items into Lakebase, one statement per row.
-
-    For very large batches, consider psycopg2.extras.execute_values for
-    higher throughput instead of per-row execute calls.
-    """
-    import json as _json
-
-    count = 0
-    with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
-            for item in items:
-                cur.execute(
-                    f"""
-                    INSERT INTO {TABLE_NAME} (id, payload, synced_at)
-                    VALUES (%s, %s, now())
-                    ON CONFLICT (id) DO UPDATE
-                        SET payload = EXCLUDED.payload,
-                            synced_at = EXCLUDED.synced_at
-                    """,
-                    (str(item.get("id")), _json.dumps(item)),
-                )
-                count += 1
-            conn.commit()
-    return count
+    return jsonify({"message": "Job removed from saved list"})
 
 
 if __name__ == '__main__':
